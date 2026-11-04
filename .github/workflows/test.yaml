@@ -1,0 +1,68 @@
+name: Test
+
+# The core suite without extras (SQLite and in-process loopbacks, plus the public-tree
+# check), then the whole suite against two Postgres clusters. The release workflow calls
+# this one before it builds.
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Public tree
+        run: python3 scripts/check_public_tree.py .
+
+      - name: Lint
+        run: uvx ruff@0.16.5 check .
+
+      - name: Test (core, no extras)
+        run: |
+          uv sync --frozen
+          uv run pytest -q
+
+  postgres:
+    runs-on: ubuntu-latest
+    # Two clusters: source and target must have different system identifiers.
+    services:
+      pg-a:
+        image: postgis/postgis:17-3.5
+        env:
+          POSTGRES_PASSWORD: test
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s --health-timeout 5s --health-retries 30
+      pg-b:
+        image: postgis/postgis:17-3.5
+        env:
+          POSTGRES_PASSWORD: test
+        ports:
+          - 55433:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s --health-timeout 5s --health-retries 30
+    env:
+      SYNC_TABLES_TEST_PG_URL: postgresql+psycopg://postgres:test@127.0.0.1:55432/postgres
+      SYNC_TABLES_TEST_PG_URL_2: postgresql+psycopg://postgres:test@127.0.0.1:55433/postgres
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Test (Postgres included)
+        run: |
+          uv sync --frozen
+          uv run pytest -q -rs
