@@ -2,17 +2,30 @@
 
 ## Environments and edges
 
-There are three environments: `local`, `dev` and `prod`. A copy runs along an **edge**,
-and only two edges exist:
+An environment is a name, one lowercase word (`[a-z][a-z0-9-]*`), carried by each
+database's marker. A copy runs along an **edge**, from one environment to another, with
+one or more transports. Typical edges:
 
 | Edge | Transports | Typical use |
 |---|---|---|
 | `dev → local` | pull, direct | a developer's machine gets a copy of the dev warehouse |
 | `dev → prod` | push | production gets a mirror of selected dev tables |
+| `dev → staging`, `dev → preprod` | push | read-only copies that mirror production |
 
-The edges and their transports are a constant in the code (`envs.EDGES`). No
-configuration file, environment variable or profile can add one. Every other pair,
-including the reverse of each edge, is refused before any connection is opened.
+**One rule is compiled in:** a sink marked `prod` accepts only a source marked `dev`
+(`prod_only_from_dev`). No configuration can change it.
+
+**Every other edge is declared twice**, once by each side, and a copy needs both:
+
+- the side that dials (a run, a relay) lists the edge and its transports in the `edges` of
+  its config file: `- {from: dev, to: local, transports: [pull, direct]}`;
+- the side that listens names the other end: a sink the sources it accepts
+  (`receive --accept-from dev`), a serving source the targets it serves
+  (`serve --serve-to local`).
+
+So no single file opens an edge, and none opens one into prod from anything but dev. An
+undeclared edge is refused with `edge_not_allowed` before any connection is opened, and a
+transport the edge does not declare with `transport_mismatch`.
 
 ## Roles
 
@@ -70,6 +83,17 @@ source → sink   view    {schema, name, body}
 sink → source   ok | err
 source → sink   bye
 ```
+
+After every table and view, a sink that advertised `caps: ["events"]` in its `accept`
+can receive the run events the push carries (see *Run events* below):
+
+```
+source → sink   events  {items}                           (once, only when nothing failed)
+sink → source   ok      {published}                       | err {code, message}
+```
+
+A sink of an earlier release sends no `caps` and gets no `events` message, so a newer
+source and an older sink still agree: the protocol version stays 2.
 
 On a pull the sink dials, so it opens each connection with a `request` naming the edge,
 the tables it wants and the phase (`plan` or `run`). The serving source answers with a
@@ -139,3 +163,38 @@ COMMENT ON DATABASE warehouse IS 'celine:env=dev';
 Both roles read the marker of their own database and refuse to run when it is missing,
 malformed or does not match the edge. The tool never writes a marker: the database owner
 sets it once, ideally in the deployment that creates the database.
+
+## Run events and the relay
+
+The pipelines' flows report each run as a `PipelineRunEvent` (`started`, `completed`,
+`failed`). Services react to `completed` on `celine/pipelines/runs/<namespace>`, and they
+must see it **after** the data it announces has reached their environment. So the events
+travel with the push:
+
+```
+flow ── HTTP POST /events ──► relay (one per environment, no token: the network is its boundary)
+                                │ keeps `completed`, answers 202
+                                ▼ one push loop
+                              push: tables, views, then events {items}   (only if every one settled ok)
+                                ▼
+                              sink: publishes each item unchanged on
+                                    celine/pipelines/runs/<namespace>, QoS 1, on its broker
+```
+
+- **The relay** (`sync-tables relay --config FILE --sink NAME`) serves `POST /events` and
+  `GET /healthz`. It validates the body as a run event (`400` otherwise, `413` above
+  64 KiB), keeps `completed` events and ignores the others.
+- **One push loop per relay.** It pushes when events are pending and `min_interval` has
+  passed since the last push started, or when `max_interval` has passed with no push, so
+  the tables are mirrored even when no flow runs. The first cycle pushes at once. One push
+  at a time; a push carries only the events received before it started.
+- **A failed push keeps its events** for the next one, ahead of newer ones. At most
+  `pending_max` are kept; above that the oldest are dropped, with a log line. A sink
+  without the capability drops them, with a log line.
+- **The sink publishes** each item unchanged with the `events` extra (celine-sdk), on the
+  broker and with the client named by `CELINE_MQTT_*` and `CELINE_OIDC_*`. A publish
+  failure is logged and the push stays `ok`: the tables are committed already.
+- **Delivery is at most once.** A lost event is not replayed; listeners that need every run
+  check on their own timer.
+- **`local` mode** (`relay --local`), for a development stack where flows and services
+  share one database: no data push, each pending event is published directly.

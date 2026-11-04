@@ -1,0 +1,47 @@
+# A sample relay config: one file for every relay of a source, each relay started with
+# `sync-tables relay --config relay.yaml --sink <name>`. Real configs stay out of this
+# repository; mount yours and keep the TLS material and tokens in secrets.
+
+# The database the relays push from, and its environment marker (celine:env=dev).
+source:
+  env: dev
+  db:
+    url: ${DB_DEV}
+
+# The edges this side pushes along. Each sink also names this source
+# (receive --accept-from dev). Only dev writes to prod, whatever a config says.
+edges:
+  - {from: dev, to: prod, transports: [push]}
+  - {from: dev, to: staging, transports: [push]}
+
+# What every relay uses unless its entry says otherwise.
+defaults:
+  min_interval: 30m     # push no sooner than this after the last push started, when events wait
+  max_interval: 30m     # push at least this often, events or not
+  pending_max: 1000     # events kept while the sink is unreachable; the oldest go first
+  parallelism: 4
+  batch_size: 5000
+  sources:              # the tables the services read, as in a profile
+    - schema: silver
+      table: orders
+      date_column: ts
+      lookback: 2d
+    - schema: gold
+      table: daily_totals
+      date_column: day
+
+# One entry per sink; the key is the environment unless `env` says otherwise.
+sinks:
+  prod:
+    url: wss://sink.example.org/sync/v1
+    ca: /etc/sync/prod/ca.crt
+    cert: /etc/sync/prod/client.crt
+    key: /etc/sync/prod/client.key
+    token_file: /etc/sync/prod/token
+  staging:
+    url: wss://staging-sink.example.org/sync/v1
+    ca: /etc/sync/staging/ca.crt
+    cert: /etc/sync/staging/client.crt
+    key: /etc/sync/staging/client.key
+    token_file: /etc/sync/staging/token
+    # allow_schemas: [gold]   # only these schemas' tables go to this sink

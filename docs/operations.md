@@ -70,17 +70,55 @@ revokes it, without a restart. A developer puts their token in `.env` as `SYNC_T
 
 ```bash
 # Serving source, next to dev (read-only role), on an internal-only host
-SYNC_SOURCE_DSN=… sync-tables serve \
+SYNC_SOURCE_DSN=… sync-tables serve --serve-to local \
   --listen 0.0.0.0:8443 --health-port 8081 \
   --allow-schemas /etc/sync/allow.txt --token-file /etc/sync/tokens/ \
   --tls-cert server.crt --tls-key server.key
 
-# Sink, next to prod (mirror role)
-SYNC_SINK_DSN=… sync-tables receive \
+# Sink, next to prod (mirror role), publishing the run events a push carries
+SYNC_SINK_DSN=… CELINE_MQTT_HOST=… CELINE_OIDC_CLIENT_ID=… CELINE_OIDC_CLIENT_SECRET=… \
+  sync-tables receive --accept-from dev --events \
   --listen 0.0.0.0:8443 --health-port 8081 \
   --allow-schemas /etc/sync/allow.txt --token-file /etc/sync/tokens/ \
   --tls-cert server.crt --tls-key server.key --client-ca push-ca.crt
 ```
+
+`--accept-from` (`SYNC_ACCEPT_FROM`, comma-separated) and `--serve-to` (`SYNC_SERVE_TO`)
+are required: they are the listener's half of each edge. A listener whose list breaks the
+compiled rule (a `prod` sink accepting anything but `dev`) refuses to start. `--events`
+(`SYNC_EVENTS=true`) needs the `events` extra, which the image carries.
+
+## Running a relay
+
+One relay per environment, each a Deployment with one replica, from one shared config
+(see [`relay.sample.yaml`](../relay.sample.yaml)):
+
+```bash
+DB_DEV=… sync-tables relay --config /etc/sync/relay.yaml --sink prod --listen 0.0.0.0:8080
+sync-tables relay --config /etc/sync/relay.yaml --sink prod --check-config   # opens nothing
+```
+
+- Expose it on a ClusterIP Service only, with a NetworkPolicy that admits the flows'
+  namespace and nothing else: that policy is its only access control.
+- The flows send to every relay listed in their `RUN_EVENTS_URLS`
+  (`http://<relay service>:8080/events`), each on its own.
+- The relay replaces the push CronJob of its edge: its `max_interval` keeps the tables
+  mirrored when no flow runs. Start with the push rate it replaces, and lower
+  `min_interval` only after measuring how long a push takes and what it writes.
+- `GET /healthz` answers `200` while the process serves.
+
+## Upgrading to 0.8.0
+
+0.8.0 declares edges in configuration. Before starting
+0.8.0:
+
+- every run and relay declares its edges in its config file (`edges`, `--config` or
+  `SYNC_CONFIG` for a run: an image ships no `config.yaml`, so a push job mounts one);
+- every sink runs with `--accept-from`, every serving source with `--serve-to`;
+- a developer's `config.yaml` declares `dev → local` (`config.sample.yaml` shows it).
+
+A 0.8.0 source pushes to a 0.6.0 or 0.7.0 sink unchanged: such a sink advertises no
+`events` capability and gets no events.
 
 ### Behind an ingress
 
@@ -193,7 +231,10 @@ Exit codes: `0` everything copied, `1` some tables failed (the others were copie
 
 | Code | Meaning |
 |---|---|
-| `edge_not_allowed`, `unknown_environment`, `transport_mismatch` | the edge or transport is not one the tool has |
+| `edge_not_allowed`, `transport_mismatch` | the edge or transport is not declared, by this side or the other |
+| `prod_only_from_dev` | something other than `dev` tried to write to `prod`: compiled in, no config opens it |
+| `unknown_environment` | not an environment name (`[a-z][a-z0-9-]*`) |
+| `events_unsupported` | events sent to a sink that does not publish them |
 | `marker_missing`, `marker_malformed`, `marker_mismatch` | a database's environment marker is absent or wrong |
 | `same_cluster` | source and target are the same cluster |
 | `schema_not_allowed` | a table is outside an allowlist |
