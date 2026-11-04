@@ -1,0 +1,8 @@
+# Only what the Dockerfile copies goes in. Everything else stays out, secrets first.
+*
+!pyproject.toml
+!uv.lock
+!README.md
+!src/
+**/__pycache__
+**/*.py[cod]

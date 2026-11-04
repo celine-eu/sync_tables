@@ -1,0 +1,37 @@
+[project]
+name = "sync-tables"
+version = "0.5.1"
+description = "Incremental table sync utility"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "cryptography>=50.0.2",
+    "geoalchemy2>=0.18.1",
+    "msgpack>=1.2.3",
+    "psycopg[binary]>=3.3.2",
+    "python-dotenv>=1.2.1",
+    "pyyaml>=6.0.3",
+    "sqlalchemy>=2.0.46",
+    "websockets>=17.2",
+]
+
+[project.scripts]
+sync-tables = "sync_tables.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sync_tables"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-cov",
+    "shapely>=2.2.0",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

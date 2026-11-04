@@ -1,0 +1,19 @@
+# The sync client material from `sync-tables certs` (private keys, the token)
+pki/
+pki-*/
+
+# Local settings and real configs: only config.sample.yaml is part of the repository
+.env
+config.yaml
+config/
+taskfile.local.yml
+
+# Python and tooling
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+dist/
+build/
