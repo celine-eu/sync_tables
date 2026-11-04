@@ -1,0 +1,50 @@
+# A sample config.yaml. Copy it to config.yaml (gitignored) and adapt it; real configs
+# stay out of this repository. Without config.yaml the tool reads DB_DEV and DB_LOCAL from
+# the environment and takes its tables from --profile FILE (README, "Configuration").
+
+# Connection URLs come from the environment (.env), never from this file, e.g.
+#   DB_DEV=postgresql+psycopg://reader@example-dev.example.org:5432/warehouse
+#   DB_LOCAL=postgresql+psycopg://owner@127.0.0.1:5432/warehouse
+source_db:
+  url: ${DB_DEV}
+destination_db:
+  url: ${DB_LOCAL}
+
+parallelism: 4
+batch_size: 5000
+create_table_if_missing: true
+
+# Where `type: path` entries find dbt models (<pipeline>/dbt/models), relative to this file.
+# pipelines_root: ../pipelines/apps
+
+# The tables of a run without a named config. Named configs go in config/<name>.yaml beside
+# config.yaml, each with only a `sources` list, and run as `sync-tables <name> ...`.
+sources:
+  # Full copy: no date_column, so the target table is truncated and reloaded on every run.
+  - schema: silver
+    table: customers
+
+  # Incremental on a watermark, re-copying the last two days on every run.
+  - schema: silver
+    table: orders
+    date_column: ts
+    lookback: 2d
+
+  # Incremental, never copying rows older than 15 days.
+  - schema: raw
+    table: events
+    date_column: ts
+    cutoff: 15d
+
+  # A pipeline's dbt models instead of a table (needs pipelines_root above):
+  # - type: path
+  #   pipeline: shop
+  #   schema_prefix: example
+  #   patterns:
+  #     - silver/orders/*
+  #     - pattern: gold/daily_totals
+  #       date_column: day
+
+# A push to a sink (dev -> prod, staging or preprod) mounts a profile instead, e.g.
+#   sync-tables --from dev --to prod --profile ./profile.yaml \
+#     --sink-url wss://sink.example.org/sync/v1 --ca ca.crt --cert client.crt --key client.key --token-file token
