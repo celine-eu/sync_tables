@@ -18,6 +18,11 @@ dependencies = [
 [project.scripts]
 sync-tables = "sync_tables.__main__:main"
 
+[project.optional-dependencies]
+events = [
+    "celine-sdk>=2.2.1",
+]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
