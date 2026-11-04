@@ -4,9 +4,8 @@ from __future__ import annotations
 from datetime import date, datetime
 
 import pytest
-from sqlalchemy import Column, DateTime, Integer, String, Table, MetaData, text
+from sqlalchemy import Column, DateTime, Integer, String, Table, MetaData
 
-from sync_tables.config import TableSpec
 from sync_tables.sync import (
     get_target_watermark,
     normalize_watermark,
@@ -237,7 +236,6 @@ def test_incremental_sync_only_new_rows(src_engine, tgt_engine):
             for batch in stream_source_rows(sc, src_table, "ts", wm, 100):
                 upsert_batch(tc, tgt_table, batch)
         tc.commit()
-        count = tc.execute(tgt_table.select()).rowcount
         result = tc.execute(tgt_table.select()).mappings().all()
         assert len(result) == 3
 

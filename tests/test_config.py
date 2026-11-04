@@ -1,7 +1,6 @@
 """Tests for config.py — pure parsing, no DB required."""
 from __future__ import annotations
 
-import os
 import textwrap
 
 import pytest
