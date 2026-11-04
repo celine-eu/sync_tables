@@ -65,8 +65,8 @@ PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 
 # The domain ends in a letter TLD, so a pinned tool (`ruff@0.16.5`) is not an address.
 EMAIL = re.compile(r"\b[A-Za-z0-9._%+-]+@((?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,})\b")
-# A TLD followed by `.name` is an attribute chain, and `self.` / `cls.` open one in code.
-HOST = re.compile(rf"(?<![\w.@-])(?!(?:self|cls)\.)((?:[a-z0-9-]+\.)+(?:{TLDS}))(?![\w-]|\.\w)", re.IGNORECASE)
+# A TLD followed by `.name` is an attribute chain, and `self.`, `cls.`, `a.`, `args.`, `cfg.` open one in code.
+HOST = re.compile(rf"(?<![\w.@-])(?!(?:self|cls|a|args|cfg)\.)((?:[a-z0-9-]+\.)+(?:{TLDS}))(?![\w-]|\.\w)", re.IGNORECASE)
 IPV4 = re.compile(r"(?<![\w.])(\d{1,3}(?:\.\d{1,3}){3})(?![\w.])")
 
 

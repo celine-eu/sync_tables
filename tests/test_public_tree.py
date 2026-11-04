@@ -86,6 +86,7 @@ def test_structural_patterns_are_refused(check, tmp_path, label, text):
         "schema: silver, table: orders, version 1.2.3",
         "self.engine.dispose() and cfg.sources and a.b",
         "self.ch = ch; self.ch.close(); cls.it",
+        "if a.local: cfg.dev and args.internal",
         "COMMENT ON DATABASE warehouse IS 'celine:env=dev'",
     ],
 )
