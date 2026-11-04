@@ -1,0 +1,72 @@
+version: "3"
+
+# Deployment-specific tasks (named configs, first-time setup, checks against a real source)
+# live in a gitignored taskfile.local.yml beside this file, written by the deployment that
+# uses the tool. Its tasks appear here without a prefix.
+includes:
+  local:
+    taskfile: taskfile.local.yml
+    optional: true
+    flatten: true
+
+tasks:
+  test:
+    desc: run test suite (Postgres tests skip; see test:pg)
+    cmds:
+      - uv run pytest
+
+  test:pg:
+    desc: run the whole suite, Postgres tests included, against two throwaway local PostGIS containers
+    cmds:
+      - |
+        bash -lc '
+          set -euo pipefail
+          IMAGE=postgis/postgis:17-3.5
+          cleanup() { docker rm -f sync-tables-test-a sync-tables-test-b >/dev/null 2>&1 || true; }
+          trap cleanup EXIT INT TERM
+          cleanup
+          docker run -d --rm --name sync-tables-test-a -e POSTGRES_PASSWORD=test -p 127.0.0.1:55432:5432 --tmpfs /var/lib/postgresql/data "$IMAGE" >/dev/null
+          docker run -d --rm --name sync-tables-test-b -e POSTGRES_PASSWORD=test -p 127.0.0.1:55433:5432 --tmpfs /var/lib/postgresql/data "$IMAGE" >/dev/null
+          for c in a b; do
+            for _ in $(seq 1 60); do
+              docker exec sync-tables-test-$c psql -U postgres -tAc "select 1" >/dev/null 2>&1 && break
+              sleep 1
+            done
+          done
+          SYNC_TABLES_TEST_PG_URL=postgresql+psycopg://postgres:test@127.0.0.1:55432/postgres \
+          SYNC_TABLES_TEST_PG_URL_2=postgresql+psycopg://postgres:test@127.0.0.1:55433/postgres \
+            uv run pytest -rs
+        '
+
+  lint:
+    desc: ruff, with the rule set in pyproject.toml (the version CI runs)
+    cmds:
+      - uvx ruff@0.16.5 check .
+
+  check:public:
+    desc: "Check the tree for what a public repository must not hold (NAMES=<file> adds reserved names kept outside it)"
+    cmds:
+      - uv run python scripts/check_public_tree.py . {{if .NAMES}}--names {{.NAMES}}{{end}}
+    vars:
+      NAMES: '{{.NAMES | default ""}}'
+
+  run:pull:
+    desc: "Pull one config from dev's serving source over WSS (CONFIG=<name>); SYNC_SOURCE_URL and the client material come from .env"
+    cmds:
+      - uv run sync-tables {{.CONFIG}} --from dev --to local {{.CLI_ARGS}}
+    vars:
+      CONFIG: '{{.CONFIG | default ""}}'
+
+  run:
+    desc: "Pull every 5 minutes (CONFIG=<name>)"
+    cmds:
+      - |
+        echo "Starting sync loop (every 5 minutes)"
+        while true; do
+          date
+          task run:pull CONFIG={{.CONFIG}} || echo "sync failed"
+          echo "Next run in 5 minutes"
+          sleep 300
+        done
+    vars:
+      CONFIG: '{{.CONFIG | default ""}}'
