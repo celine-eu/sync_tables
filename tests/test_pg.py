@@ -134,7 +134,7 @@ def direct(src_url, tgt_url, specs=SPECS, allowed=("mirror",), edge=("dev", "loc
 # S3 markers, read from the catalog
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("marker,code", [(None, "marker_missing"), ("celine:env=staging", "marker_malformed")])
+@pytest.mark.parametrize("marker,code", [(None, "marker_missing"), ("celine:env=qa", "marker_malformed")])
 def test_marker_missing_or_malformed(clusters, marker, code):
     url = fresh_db(clusters[0], PREFIX + "marker", marker)
     with create_engine(url).connect() as c, pytest.raises(Refused) as e:
