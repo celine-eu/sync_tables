@@ -20,6 +20,7 @@ sync-tables [CONFIG] --from dev --to local [--profile FILE] [--full-refresh]   (
 sync-tables [CONFIG] --from dev --to prod|staging|preprod --sink-url wss://… --ca F --cert F --key F --token-file F [--profile FILE]
 sync-tables receive …   (run a sink; see `sync-tables receive --help`)
 sync-tables serve …     (run a serving source for pulls; see `sync-tables serve --help`)
+sync-tables relay …     (take run events over HTTP, push them with the data; see `sync-tables relay --help`)
 sync-tables certs …     (generate the sync's mTLS material; see `sync-tables certs --help`)
 sync-tables --list
 """
@@ -35,6 +36,8 @@ def main(argv: list[str] | None = None) -> int:
         return receive_main(argv[1:])
     if argv[:1] == ["serve"]:
         return serve_main(argv[1:])
+    if argv[:1] == ["relay"]:
+        return relay_main(argv[1:])
     return sync_main(argv)
 
 
@@ -467,6 +470,86 @@ def _serve(a: argparse.Namespace) -> int:
     return _listen(server, health, f"serve: environment {me.env}, serves {', '.join(sorted(serve_to))}, "
                                    f"{len(schemas)} allowed schema(s), "
                                    f"{len(tokens.names)} token holder(s), {_tls_line(tls, upstream)}; listening")
+
+
+# ---------------------------------------------------------------------------
+# A relay: run events in over HTTP, pushed with the data (one per environment)
+# ---------------------------------------------------------------------------
+
+def relay_main(argv: list[str]) -> int:
+    env = os.environ.get
+    p = argparse.ArgumentParser(
+        prog="sync-tables relay",
+        description="Run a relay: take the flows' run events on POST /events (no token: the network is "
+        "the boundary) and push them to one sink after the tables, on min_interval/max_interval.",
+    )
+    p.add_argument("--config", default=env("SYNC_RELAY_CONFIG"), help="the relay config [SYNC_RELAY_CONFIG]")
+    p.add_argument("--sink", default=env("SYNC_RELAY_SINK"), help="the sink entry this relay serves [SYNC_RELAY_SINK]")
+    p.add_argument("--listen", default=env("SYNC_LISTEN", "0.0.0.0:8080"), help="host:port of /events and /healthz [SYNC_LISTEN]")
+    p.add_argument("--check-config", action="store_true", help="load and check the config, open nothing, exit")
+    p.add_argument("--local", action="store_true",
+                   help="development: no data push, publish each event on the broker (extra `events`; "
+                        "CELINE_MQTT_*, CELINE_OIDC_*)")
+    a = p.parse_args(argv)
+    try:
+        return _relay(a)
+    except Refused as r:
+        log(str(r))
+        return EXIT_REFUSED
+    except SyncError as e:
+        log(f"ERROR: {e}")
+        return EXIT_REFUSED
+    except Exception as e:
+        log(f"ERROR: {safe_error(e)}")
+        return EXIT_REFUSED
+
+
+def _relay(a: argparse.Namespace) -> int:
+    import signal  # noqa: PLC0415
+    import threading  # noqa: PLC0415
+
+    from sync_tables.relay import Relay, load_relay_config, make_local_push, make_push, start_http  # noqa: PLC0415
+
+    host, _, port = a.listen.rpartition(":")
+    if a.local:
+        relay = Relay(make_local_push(_events_publisher(True)), min_interval=0, max_interval=3600)
+        line = "relay: local mode, events published directly"
+    else:
+        if not a.config or not a.sink:
+            raise SyncError("give --config FILE and --sink NAME (or --local)")
+        cfg = load_relay_config(a.config, a.sink)
+        line = (f"relay: {cfg.from_env} -> {cfg.to_env} ({cfg.sink}), {len(cfg.sources)} table(s), "
+                f"min_interval={cfg.min_interval}s, max_interval={cfg.max_interval}s, pending_max={cfg.pending_max}")
+        if a.check_config:
+            log(line + "; config ok")
+            return EXIT_OK
+        from sync_tables.db import make_source_engine  # noqa: PLC0415
+        from sync_tables.source import Source  # noqa: PLC0415
+        from sync_tables.wss import channel_factory, client_tls, read_token  # noqa: PLC0415
+
+        if not cfg.source_db_url:
+            raise SyncError("the source connection URL is not set (source.db.url in the relay config)")
+        source = Source(make_source_engine(cfg.source_db_url, pool_size=cfg.parallelism + 1),
+                        (cfg.from_env, cfg.to_env), batch_size=cfg.batch_size)
+        source.check_identity()  # refuse to start on an unmarked or wrong database
+        open_channel = channel_factory(cfg.url, client_tls(cfg.ca, cfg.cert, cfg.key), read_token(cfg.token_file))
+        relay = Relay(make_push(source, cfg.sources, open_channel, cfg.parallelism),
+                      min_interval=cfg.min_interval, max_interval=cfg.max_interval, pending_max=cfg.pending_max)
+    if a.check_config:
+        log(line + "; config ok")
+        return EXIT_OK
+
+    stop = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+    server = start_http(relay, host or "0.0.0.0", int(port))
+    log(line + "; listening")
+    try:
+        relay.run(stop)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.shutdown()
+    return EXIT_OK
 
 
 if __name__ == "__main__":
