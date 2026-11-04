@@ -1,8 +1,8 @@
 name: Test
 
 # The core suite without extras (SQLite and in-process loopbacks, plus the public-tree
-# check), then the whole suite against two Postgres clusters. The release workflow calls
-# this one before it builds.
+# check), the suite with every extra (the MQTT publisher), then the whole suite against two
+# Postgres clusters. The release workflow calls this one before it builds.
 on:
   push:
     branches:
@@ -30,6 +30,18 @@ jobs:
       - name: Test (core, no extras)
         run: |
           uv sync --frozen
+          uv run pytest -q
+
+  extras:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Test (all extras)
+        run: |
+          uv sync --frozen --all-extras
           uv run pytest -q
 
   postgres:
@@ -62,7 +74,7 @@ jobs:
 
       - uses: astral-sh/setup-uv@v6
 
-      - name: Test (Postgres included)
+      - name: Test (Postgres included, all extras)
         run: |
-          uv sync --frozen
+          uv sync --frozen --all-extras
           uv run pytest -q -rs
