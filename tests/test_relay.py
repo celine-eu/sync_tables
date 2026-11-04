@@ -28,6 +28,7 @@ from sync_tables.relay import (
 from sync_tables.source import EVENTS_DELIVERED, EVENTS_UNDELIVERED, EVENTS_UNSUPPORTED
 from test_events import EVENTS, FakePublisher
 from test_exchange import INCR, make_pair, seed
+from test_wss import pki  # noqa: F401 — the module-scoped PKI fixture
 
 
 def event(run_id: str, status: str = "completed") -> dict:
@@ -392,3 +393,36 @@ def test_check_config_opens_no_connection(tmp_path, monkeypatch, capsys):
     assert main(["relay", "--config", path, "--sink", "staging", "--check-config"]) == 0
     assert "dev -> staging" in capsys.readouterr().out
     assert main(["relay", "--config", path, "--sink", "preprod", "--check-config"]) == 2
+
+
+# ---------------------------------------------------------------------------
+# End to end over WSS: a relay pushes to a listening sink that publishes
+# ---------------------------------------------------------------------------
+
+def test_a_relay_pushes_over_wss_and_the_sink_publishes(pki):  # noqa: F811 — pytest fixture
+    from sync_tables.sink import Sink  # noqa: PLC0415
+    from sync_tables.source import Source  # noqa: PLC0415
+    from sync_tables.wss import channel_factory, client_tls, make_server, server_tls  # noqa: PLC0415
+    from test_wss import DEV, PROD, SPEC, engine, free_port, rows, source_with_rows, token_of  # noqa: PLC0415
+
+    out, _ = pki
+    pub = FakePublisher()
+    tgt = engine()
+    sink = Sink(tgt, ["main"], identify=lambda c: PROD, accept_from={"dev"}, publisher=pub)
+    port = free_port()
+    server = make_server(sink, "127.0.0.1", port, token_of(out),
+                         server_tls(f"{out}/server.crt", f"{out}/server.key", f"{out}/ca.crt"))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        src = source_with_rows()
+        tls = client_tls(f"{out}/ca.crt", f"{out}/client-source.crt", f"{out}/client-source.key")
+        source = Source(src, ("dev", "prod"), identify=lambda c: DEV)
+        push = make_push(source, [SPEC], channel_factory(f"wss://localhost:{port}", tls, token_of(out)), 1)
+        r = Relay(push, min_interval=0, max_interval=60)
+        r.offer(EVENTS[0])
+        assert r.step() is True
+        assert r.pending() == []
+        assert pub.sent == [("celine/pipelines/runs/shop", EVENTS[0])]
+        assert rows(tgt) == rows(src)
+    finally:
+        server.shutdown()
