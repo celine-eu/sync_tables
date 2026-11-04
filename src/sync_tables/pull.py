@@ -16,7 +16,7 @@ from typing import Any, Callable, Iterable
 from sqlalchemy.engine import Engine
 
 from sync_tables.config import TableSpec, parse_cutoff, parse_lookback
-from sync_tables.envs import PULL, IdentityReader, pick_transport
+from sync_tables.envs import IdentityReader, check_listener
 from sync_tables.log import Refused, SyncError, log, safe_error
 from sync_tables.protocol import PROTOCOL_VERSION, Channel, ConnectionLost, recv, send, serve_sink
 from sync_tables.source import RunResult, Source
@@ -71,8 +71,12 @@ class SourceServer:
         allowed_schemas: Iterable[str],
         identify: IdentityReader | None = None,
         batch_size: int = 5000,
+        serve_to: Iterable[str] | None = None,
     ) -> None:
+        """`serve_to`: the targets this source serves (`serve --serve-to`). None leaves only
+        the compiled rule; the CLI always passes a list."""
         self.engine = engine
+        self.serve_to = None if serve_to is None else frozenset(serve_to)
         self.allowed_schemas = frozenset(allowed_schemas)
         if not self.allowed_schemas:
             raise SyncError("the serving source needs at least one allowed schema")
@@ -126,7 +130,7 @@ class SourceServer:
             from_env, to_env = (str(x) for x in req["edge"])
         except (KeyError, TypeError, ValueError):
             raise Refused("bad_message", "malformed edge") from None
-        pick_transport(from_env, to_env, PULL)
+        check_listener(from_env, to_env, self.serve_to, end="to")
         phase = req.get("phase")
         if phase not in ("plan", "run"):
             raise Refused("bad_message", "a request's phase is plan or run")

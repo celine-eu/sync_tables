@@ -1,64 +1,119 @@
 """Environments, the edges between them, and how each database says which it is.
 
-Plan S1–S4 and W2. The allowed edges and their transports are compiled in: nothing in a
-config file, a variable or a profile can add one. The copy runs one way only.
+Plan decision 8 and design item 6. Environment names are free: one lowercase word
+(`[a-z][a-z0-9-]*`). One rule is compiled in and no configuration can change it: a sink
+marked `prod` accepts only a source marked `dev`. Every other edge comes from
+configuration, declared on both sides: the side that dials lists it in the `edges` of its
+config file (`EdgePolicy`), and the side that listens names the other end
+(`receive --accept-from`, `serve --serve-to`; `check_listener`). A copy needs both, so no
+single file opens an edge, and none opens one into prod. The copy runs one way only.
 """
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
-from typing import Callable
+from collections.abc import Iterable
+from dataclasses import dataclass, field
+from typing import Any, Callable
 
 from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
-from sync_tables.log import Refused
-
-ENVIRONMENTS = ("local", "dev", "prod", "staging", "preprod")
+from sync_tables.log import Refused, SyncError
 
 DIRECT = "direct"  # in process: the tool reads the source and writes the sink's database itself
 PUSH = "push"      # the source dials a sink over WSS
 PULL = "pull"      # the sink dials a serving source over WSS (a developer's machine, behind NAT)
+TRANSPORTS = (DIRECT, PUSH, PULL)
 
-# (from, to) -> the transports it may use. Every other pair, including the reverse of each,
-# is refused. Whichever side dials, the rows flow from the source to the sink.
-EDGES: dict[tuple[str, str], tuple[str, ...]] = {
-    ("dev", "local"): (PULL, DIRECT),
-    ("dev", "prod"): (PUSH,),
-    # staging and preprod: read-only copies of the warehouse's output, like prod; they send
-    # nothing on, to prod or anywhere else.
-    ("dev", "staging"): (PUSH,),
-    ("dev", "preprod"): (PUSH,),
-}
+# The one compiled rule: only this source may write to this target.
+PROD, DEV = "prod", "dev"
 
-MARKER_RE = re.compile(r"celine:env=(local|dev|prod|staging|preprod)")
+ENV_NAME = r"[a-z][a-z0-9-]*"
+ENV_NAME_RE = re.compile(ENV_NAME)
+MARKER_RE = re.compile(rf"celine:env=({ENV_NAME})")
 
 
-def check_edge(from_env: str, to_env: str) -> tuple[str, ...]:
-    """Return the edge's transports, or refuse. Runs before any connection is opened."""
-    for env in (from_env, to_env):
-        if env not in ENVIRONMENTS:
-            raise Refused("unknown_environment", f"{env!r} is not one of {', '.join(ENVIRONMENTS)}")
-    transport = EDGES.get((from_env, to_env))
-    if transport is None:
-        allowed = ", ".join(f"{a} -> {b}" for a, b in EDGES)
-        raise Refused("edge_not_allowed", f"{from_env} -> {to_env} is not an allowed edge (allowed: {allowed})")
-    return transport
+def check_name(env: Any) -> str:
+    """Refuse anything that is not an environment name."""
+    if not isinstance(env, str) or ENV_NAME_RE.fullmatch(env) is None:
+        raise Refused("unknown_environment", f"{env!r} is not an environment name ([a-z][a-z0-9-]*)")
+    return env
 
 
-def pick_transport(from_env: str, to_env: str, wanted: str) -> str:
-    """Refuse a transport the edge does not use; `wanted` follows from the URLs given."""
-    transports = check_edge(from_env, to_env)
-    if wanted not in transports:
-        raise Refused(
-            "transport_mismatch",
-            f"{from_env} -> {to_env} does not {wanted} (it uses: {', '.join(transports)})",
-        )
-    return wanted
+def check_rule(from_env: Any, to_env: Any) -> None:
+    """The compiled rule, which every edge passes before any configuration is read."""
+    check_name(from_env)
+    check_name(to_env)
+    if from_env == to_env:
+        raise Refused("edge_not_allowed", f"an edge joins two environments, not {from_env!r} to itself")
+    if to_env == PROD and from_env != DEV:
+        raise Refused("prod_only_from_dev", f"only {DEV!r} writes to {PROD!r}, not {from_env!r}")
 
 
-def destinations_from(from_env: str) -> set[str]:
-    return {b for (a, b) in EDGES if a == from_env}
+@dataclass(frozen=True)
+class EdgePolicy:
+    """The edges the dialling side declares, each with its transports."""
+
+    declared: dict[tuple[str, str], tuple[str, ...]] = field(default_factory=dict)
+
+    @classmethod
+    def from_config(cls, raw: Any) -> "EdgePolicy":
+        """Parse an `edges` list: [{from, to, transports: [push|pull|direct, ...]}, ...]."""
+        if raw is None:
+            return cls()
+        if not isinstance(raw, list):
+            raise SyncError("config: `edges` is a list of {from, to, transports}")
+        declared: dict[tuple[str, str], tuple[str, ...]] = {}
+        for entry in raw:
+            if not isinstance(entry, dict) or not {"from", "to", "transports"} <= set(entry):
+                raise SyncError("config: each edge has `from`, `to` and `transports`")
+            transports = entry["transports"]
+            if (not isinstance(transports, list) or not transports
+                    or any(t not in TRANSPORTS for t in transports)):
+                raise SyncError(f"config: an edge's transports are a list of {', '.join(TRANSPORTS)}")
+            edge = (entry["from"], entry["to"])
+            check_rule(*edge)
+            if edge in declared:
+                raise SyncError(f"config: the edge {edge[0]} -> {edge[1]} is declared twice")
+            declared[edge] = tuple(dict.fromkeys(transports))
+        return cls(declared)
+
+    def transports(self, from_env: str, to_env: str) -> tuple[str, ...]:
+        """The edge's transports, or refuse. Runs before any connection is opened."""
+        check_rule(from_env, to_env)
+        found = self.declared.get((from_env, to_env))
+        if found is None:
+            known = ", ".join(f"{a} -> {b}" for a, b in self.declared) or "none"
+            raise Refused(
+                "edge_not_allowed",
+                f"{from_env} -> {to_env} is not declared in the `edges` of config.yaml (declared: {known})",
+            )
+        return found
+
+    def pick(self, from_env: str, to_env: str, wanted: str) -> str:
+        """Refuse a transport the edge does not declare; `wanted` follows from the URLs given."""
+        transports = self.transports(from_env, to_env)
+        if wanted not in transports:
+            raise Refused(
+                "transport_mismatch",
+                f"{from_env} -> {to_env} does not {wanted} (it uses: {', '.join(transports)})",
+            )
+        return wanted
+
+
+def check_listener(from_env: Any, to_env: Any, accepted: Iterable[str] | None, end: str) -> None:
+    """The listening side's half: the compiled rule, then its own list of the other end.
+
+    `end` is "from" for a sink (the sources it accepts) and "to" for a serving source (the
+    targets it serves). `accepted=None` leaves only the rule: the CLI always passes a list.
+    """
+    check_rule(from_env, to_env)
+    if accepted is None:
+        return
+    other = from_env if end == "from" else to_env
+    if other not in set(accepted):
+        flag = "--accept-from" if end == "from" else "--serve-to"
+        raise Refused("edge_not_allowed", f"{from_env} -> {to_env}: {other!r} is not in this listener's {flag}")
 
 
 @dataclass(frozen=True)

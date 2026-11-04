@@ -5,9 +5,12 @@ import re
 from dataclasses import dataclass
 from datetime import timedelta
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import yaml
+
+if TYPE_CHECKING:
+    from sync_tables.envs import EdgePolicy
 
 
 def parse_cutoff(s: str) -> timedelta:
@@ -128,6 +131,19 @@ def load_profile(path: str, pipelines_root: str | None = None) -> list[TableSpec
         return pipelines_root
 
     return _parse_sources(raw.get("sources", []), get_pipelines_root)
+
+
+def load_edges(path: str = "./config.yaml") -> "EdgePolicy":
+    """The `edges` a config file declares; none when the file is missing."""
+    from sync_tables.envs import EdgePolicy  # noqa: PLC0415
+
+    if not os.path.isfile(path):
+        return EdgePolicy()
+    with open(path, "r", encoding="utf-8") as f:
+        raw = yaml.safe_load(f) or {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path}: not a mapping")
+    return EdgePolicy.from_config(raw.get("edges"))
 
 
 def list_configs(base_path: str = "./config") -> list[str]:

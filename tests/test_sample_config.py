@@ -49,3 +49,11 @@ def test_sample_works_as_config_yaml_with_a_named_config(tmp_path, monkeypatch):
     monkeypatch.delenv("DB_LOCAL", raising=False)
     cfg = load_config(str(tmp_path / "config.yaml"), config_name="orders")
     assert cfg.sources == [TableSpec(schema="silver", table="orders", date_column="ts")]
+
+
+def test_sample_declares_the_developer_edge():
+    """dev -> local is declared like every other edge (plan decision 8)."""
+    from sync_tables.config import load_edges
+    from sync_tables.envs import DIRECT, PULL
+
+    assert load_edges(str(SAMPLE)).declared == {("dev", "local"): (PULL, DIRECT)}
