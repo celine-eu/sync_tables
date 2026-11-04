@@ -133,13 +133,13 @@ def test_the_source_reads_only_its_allowlist():
 
 
 @pytest.mark.parametrize("edge,code", [
-    (("dev", "prod"), "transport_mismatch"),   # prod is pushed to, never pulled
+    (("dev", "prod"), "edge_not_allowed"),     # prod is not in --serve-to (0.8.0: declared, not compiled)
     (("local", "dev"), "edge_not_allowed"),
 ])
 def test_the_source_refuses_an_edge_that_does_not_pull(edge, code):
     src = source_with_rows(3)
     _, sink = local_sink()
-    server = SourceServer(src, ["main"], identify=lambda c: DEV)
+    server = SourceServer(src, ["main"], identify=lambda c: DEV, serve_to={"local"})
     with pytest.raises(Refused) as e:
         pull([SPEC], edge, served(server), sink)
     assert e.value.code == code
@@ -242,8 +242,12 @@ def test_pull_over_mtls(pki):
 # The CLI picks the transport from the URL given
 # ---------------------------------------------------------------------------
 
-def test_a_source_url_on_a_push_edge_is_refused(capsys):
+def test_a_source_url_on_a_push_edge_is_refused(capsys, monkeypatch, tmp_path):
     from sync_tables.__main__ import main
+    from test_exchange import CONFIG_YAML
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config.yaml").write_text(CONFIG_YAML)
 
     assert main(["--from", "dev", "--to", "prod", "--source-url", "wss://source.example.org"]) == 2
     assert main(["--from", "dev", "--to", "local", "--source-url", "wss://a.example.org",
@@ -257,7 +261,8 @@ def test_a_pull_needs_its_client_material(monkeypatch, capsys, tmp_path):
     monkeypatch.setattr("sync_tables.__main__.load_dotenv", lambda **k: None)  # not this checkout's .env
     for v in ("SYNC_TLS_CA", "SYNC_TLS_CERT", "SYNC_TLS_KEY", "SYNC_TOKEN_FILE"):
         monkeypatch.delenv(v, raising=False)
-    monkeypatch.chdir(tmp_path)  # no config.yaml: the built-in defaults, as in the image
+    monkeypatch.chdir(tmp_path)  # a config.yaml with the edges only: the built-in defaults otherwise
+    (tmp_path / "config.yaml").write_text("edges:\n  - {from: dev, to: local, transports: [pull]}\n")
     (tmp_path / "profile.yaml").write_text("sources:\n  - {schema: main, table: readings}\n")
     assert main(["--from", "dev", "--to", "local", "--profile", "profile.yaml",
                  "--source-url", "wss://source.example.org"]) == 2

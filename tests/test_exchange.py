@@ -13,7 +13,7 @@ import pytest
 from sqlalchemy import MetaData, Table, create_engine, text
 
 from sync_tables.config import TableSpec
-from sync_tables.envs import EDGES, ENVIRONMENTS, Identity, check_edge, parse_marker
+from sync_tables.envs import EdgePolicy, Identity, parse_marker
 from sync_tables.catalog import check_type_sql
 from sync_tables.log import Refused, SyncError
 from sync_tables.codec import unpack
@@ -73,14 +73,37 @@ ALL = "SELECT id, datetime(ts), value FROM readings ORDER BY id"
 
 
 # ---------------------------------------------------------------------------
-# S2: edges
+# S2: edges. Since 0.8.0 they are declared by configuration (plan decision 8): the 0.6.0
+# edges are a config here, and the cases below check them through it. The compiled rule
+# (only dev writes to prod) answers prod_only_from_dev; tests/test_edges.py covers the rest.
 # ---------------------------------------------------------------------------
+
+ENVIRONMENTS = ("local", "dev", "prod", "staging", "preprod")
+EDGES = {
+    ("dev", "local"): ("pull", "direct"),
+    ("dev", "prod"): ("push",),
+    ("dev", "staging"): ("push",),
+    ("dev", "preprod"): ("push",),
+}
+POLICY = EdgePolicy.from_config([{"from": a, "to": b, "transports": list(t)} for (a, b), t in EDGES.items()])
+CONFIG_YAML = "edges:\n" + "".join(
+    f"  - {{from: {a}, to: {b}, transports: [{', '.join(t)}]}}\n" for (a, b), t in EDGES.items()
+)
+
+
+def check_edge(a, b):
+    return POLICY.transports(a, b)
+
+
+def refusal(a, b):
+    return "prod_only_from_dev" if a != b and b == "prod" and a != "dev" else "edge_not_allowed"
+
 
 @pytest.mark.parametrize("a,b", [p for p in itertools.product(ENVIRONMENTS, repeat=2) if p not in EDGES])
 def test_every_other_edge_is_refused(a, b):
     with pytest.raises(Refused) as e:
         check_edge(a, b)
-    assert e.value.code == "edge_not_allowed"
+    assert e.value.code == refusal(a, b)
 
 
 def test_the_reverse_of_each_allowed_edge_is_refused():
@@ -91,19 +114,14 @@ def test_the_reverse_of_each_allowed_edge_is_refused():
 
 def test_unknown_environment_is_refused():
     with pytest.raises(Refused) as e:
-        check_edge("dev", "qa")
+        check_edge("dev", "Qa")
     assert e.value.code == "unknown_environment"
 
 
 def test_the_edges_are_exactly_these():
     """The warehouse (`dev`) feeds every environment; nothing else moves rows. staging and
     preprod are push sinks like prod: read-only copies that send nothing back."""
-    assert EDGES == {
-        ("dev", "local"): ("pull", "direct"),
-        ("dev", "prod"): ("push",),
-        ("dev", "staging"): ("push",),
-        ("dev", "preprod"): ("push",),
-    }
+    assert POLICY.declared == EDGES
 
 
 @pytest.mark.parametrize("a,b", [
@@ -114,7 +132,7 @@ def test_the_edges_are_exactly_these():
 def test_staging_and_preprod_send_nothing_on(a, b):
     with pytest.raises(Refused) as e:
         check_edge(a, b)
-    assert e.value.code == "edge_not_allowed"
+    assert e.value.code == refusal(a, b)
 
 
 @pytest.mark.parametrize("env", ["staging", "preprod"])
@@ -122,9 +140,12 @@ def test_staging_and_preprod_markers_are_read(env):
     assert parse_marker(f"celine:env={env}", "target") == env
 
 
-def test_a_refused_edge_opens_no_connection(monkeypatch, capsys):
+def test_a_refused_edge_opens_no_connection(monkeypatch, capsys, tmp_path):
     import sync_tables.db as db
     from sync_tables.__main__ import main
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config.yaml").write_text(CONFIG_YAML)
 
     def boom(*a, **k):
         raise AssertionError("a connection was opened")
@@ -136,8 +157,11 @@ def test_a_refused_edge_opens_no_connection(monkeypatch, capsys):
     assert "edge_not_allowed" in capsys.readouterr().out
 
 
-def test_transport_is_compiled_per_edge(capsys):
+def test_transport_is_compiled_per_edge(capsys, monkeypatch, tmp_path):
     from sync_tables.__main__ import main
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config.yaml").write_text(CONFIG_YAML)
 
     assert main(["--from", "dev", "--to", "local", "--sink-url", "wss://sink.example.org"]) == 2
     assert main(["--from", "dev", "--to", "prod"]) == 2
@@ -160,7 +184,7 @@ def test_a_dsn_is_not_a_push_target():
 @pytest.mark.parametrize("comment,code", [
     (None, "marker_missing"),
     ("", "marker_missing"),
-    ("celine:env=qa", "marker_malformed"),
+    ("celine:env=-qa", "marker_malformed"),
     ("env=dev", "marker_malformed"),
     ("celine:env=dev extra", "marker_malformed"),
     ("celine:env=DEV", "marker_malformed"),

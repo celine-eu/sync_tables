@@ -8,8 +8,8 @@ import time
 
 from dotenv import load_dotenv
 
-from sync_tables.config import list_configs, load_config, load_profile
-from sync_tables.envs import DIRECT, PULL, PUSH, pick_transport
+from sync_tables.config import list_configs, load_config, load_edges, load_profile
+from sync_tables.envs import DIRECT, PULL, PUSH, check_name, check_rule
 from sync_tables.log import Refused, SyncError, log, safe_error
 
 EXIT_OK, EXIT_TABLES_FAILED, EXIT_REFUSED = 0, 1, 2
@@ -51,6 +51,8 @@ def sync_main(argv: list[str]) -> int:
     p.add_argument("config_name", nargs="?", default=None, help="named config from config/ next to config.yaml (e.g. 'orders')")
     p.add_argument("--from", dest="from_env", help="source environment (dev)")
     p.add_argument("--to", dest="to_env", help="target environment (local, prod, staging, preprod)")
+    p.add_argument("--config", default=env("SYNC_CONFIG", "./config.yaml"),
+                   help="the config file: settings, the `edges` this side declares, the tables [SYNC_CONFIG]")
     p.add_argument("--profile", help="a profile file mounted at run time, instead of a named config")
     p.add_argument("--full-refresh", action="store_true", help="truncate target tables and re-sync all rows")
     p.add_argument("--list", action="store_true", help="list the named configs and exit")
@@ -72,7 +74,8 @@ def sync_main(argv: list[str]) -> int:
 
     started = time.monotonic()
     try:
-        transport = pick_transport(a.from_env, a.to_env, _wanted(a))  # before any connection is opened
+        # before any connection is opened: the edge must be declared in config.yaml
+        transport = load_edges(a.config).pick(a.from_env, a.to_env, _wanted(a))
         result = _run(a, transport)
     except Refused as r:
         log(str(r))
@@ -113,7 +116,7 @@ def _run(a: argparse.Namespace, transport: str):
         peer = "a sink; give --sink-url" if transport == PUSH else "a serving source; give --source-url"
         raise Refused("transport_mismatch", f"{a.from_env} -> {a.to_env} {transport}s over WSS from {peer} wss://…")
 
-    cfg = load_config("./config.yaml", config_name=None if a.profile else a.config_name)
+    cfg = load_config(a.config, config_name=None if a.profile else a.config_name)
     specs = load_profile(a.profile) if a.profile else cfg.sources
     label = a.profile and os.path.basename(a.profile) or a.config_name or "config.yaml"
     if not specs:
@@ -229,6 +232,8 @@ def receive_main(argv: list[str]) -> int:
                    help="behind an ingress: the header it forwards the verified client certificate in "
                         "(X-Forwarded-Tls-Client-Cert for Traefik, ssl-client-cert for ingress-nginx); checked "
                         "again against --client-ca, and a request without one is refused [SYNC_UPSTREAM_CERT_HEADER]")
+    p.add_argument("--accept-from", action="append", default=_env_list("SYNC_ACCEPT_FROM"), metavar="ENV",
+                   help="a source environment this sink accepts (repeatable; required) [SYNC_ACCEPT_FROM, comma-separated]")
     _limit_args(p, env)
     p.add_argument("--no-create-tables", action="store_true", help="refuse tables that do not exist yet")
     a = p.parse_args(argv)
@@ -252,6 +257,7 @@ def _receive(a: argparse.Namespace) -> int:
     from sync_tables.sink import Sink  # noqa: PLC0415
     from sync_tables.wss import make_server, start_health  # noqa: PLC0415
 
+    accept_from = _edge_list(a.accept_from, "--accept-from", "the source environments this sink accepts")
     dsn = os.environ.get("SYNC_SINK_DSN")
     if not dsn:
         raise SyncError("SYNC_SINK_DSN is not set")
@@ -261,12 +267,15 @@ def _receive(a: argparse.Namespace) -> int:
     with engine.connect() as conn:
         me = read_identity(conn, side="target")  # refuse to start unmarked
         ensure_postgis(conn)
-    sink = Sink(engine, schemas, create_table_if_missing=not a.no_create_tables, log_summaries=True)
+    _check_listener_edges(me.env, accept_from, end="from")
+    sink = Sink(engine, schemas, create_table_if_missing=not a.no_create_tables, log_summaries=True,
+                accept_from=accept_from)
 
     host, _, port = a.listen.rpartition(":")
     health = start_health(host or "0.0.0.0", a.health_port)
     server = make_server(sink, host or "0.0.0.0", int(port), tokens, tls, limiter=_limiter(a), upstream_cert=upstream)
-    return _listen(server, health, f"sink: environment {me.env}, {len(schemas)} allowed schema(s), "
+    return _listen(server, health, f"sink: environment {me.env}, accepts from {', '.join(sorted(accept_from))}, "
+                                   f"{len(schemas)} allowed schema(s), "
                                    f"{len(tokens.names)} token holder(s), {_tls_line(tls, upstream)}; listening")
 
 
@@ -297,6 +306,8 @@ def serve_main(argv: list[str]) -> int:
                    help="behind an ingress: the header it forwards the verified client certificate in "
                         "(X-Forwarded-Tls-Client-Cert for Traefik, ssl-client-cert for ingress-nginx); checked "
                         "again against --client-ca, and a request without one is refused [SYNC_UPSTREAM_CERT_HEADER]")
+    p.add_argument("--serve-to", action="append", default=_env_list("SYNC_SERVE_TO"), metavar="ENV",
+                   help="a target environment this source serves (repeatable; required) [SYNC_SERVE_TO, comma-separated]")
     _limit_args(p, env)
     p.add_argument("--batch-size", type=int, default=int(env("SYNC_BATCH_SIZE", "5000")), help="rows per batch [SYNC_BATCH_SIZE]")
     a = p.parse_args(argv)
@@ -312,6 +323,27 @@ def serve_main(argv: list[str]) -> int:
     except Exception as e:
         log(f"ERROR: {safe_error(e)}")
         return EXIT_REFUSED
+
+
+def _env_list(var: str) -> list[str]:
+    """A comma-separated variable as a list (the default of a repeatable flag)."""
+    return [x.strip() for x in os.environ.get(var, "").split(",") if x.strip()]
+
+
+def _edge_list(values: list[str], flag: str, what: str) -> frozenset[str]:
+    """A listener's half of its edges: required, and each a valid environment name."""
+    if not values:
+        raise SyncError(f"give {flag} ENV ({what}; repeatable)")
+    return frozenset(check_name(v) for v in values)
+
+
+def _check_listener_edges(me: str, others: frozenset[str] | set[str], end: str) -> None:
+    """Refuse to start when the listener's own list breaks the compiled rule."""
+    for other in sorted(others):
+        if end == "from":
+            check_rule(other, me)
+        else:
+            check_rule(me, other)
 
 
 def _limit_args(p: argparse.ArgumentParser, env) -> None:
@@ -399,6 +431,7 @@ def _serve(a: argparse.Namespace) -> int:
     from sync_tables.pull import SourceServer  # noqa: PLC0415
     from sync_tables.wss import make_channel_server, start_health  # noqa: PLC0415
 
+    serve_to = _edge_list(a.serve_to, "--serve-to", "the target environments this source serves")
     dsn = os.environ.get("SYNC_SOURCE_DSN")
     if not dsn:
         raise SyncError("SYNC_SOURCE_DSN is not set")
@@ -408,13 +441,15 @@ def _serve(a: argparse.Namespace) -> int:
     with engine.connect() as conn:
         set_source_read_only(conn)
         me = read_identity(conn, side="source")  # refuse to start unmarked
-    server_role = SourceServer(engine, schemas, batch_size=a.batch_size)
+    _check_listener_edges(me.env, serve_to, end="to")
+    server_role = SourceServer(engine, schemas, batch_size=a.batch_size, serve_to=serve_to)
 
     host, _, port = a.listen.rpartition(":")
     health = start_health(host or "0.0.0.0", a.health_port)
     server = make_channel_server(server_role.serve, host or "0.0.0.0", int(port), tokens, tls, limiter=_limiter(a),
                                  upstream_cert=upstream)
-    return _listen(server, health, f"serve: environment {me.env}, {len(schemas)} allowed schema(s), "
+    return _listen(server, health, f"serve: environment {me.env}, serves {', '.join(sorted(serve_to))}, "
+                                   f"{len(schemas)} allowed schema(s), "
                                    f"{len(tokens.names)} token holder(s), {_tls_line(tls, upstream)}; listening")
 
 

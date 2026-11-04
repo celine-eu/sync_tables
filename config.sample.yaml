@@ -10,6 +10,13 @@ source_db:
 destination_db:
   url: ${DB_LOCAL}
 
+# The edges this side dials, each with its transports (push, pull, direct). An edge also
+# needs the other side: a sink lists the sources it accepts (receive --accept-from), a
+# serving source the targets it serves (serve --serve-to). Only dev writes to prod, whatever
+# a config says.
+edges:
+  - {from: dev, to: local, transports: [pull, direct]}
+
 parallelism: 4
 batch_size: 5000
 create_table_if_missing: true

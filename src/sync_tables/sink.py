@@ -23,7 +23,7 @@ from sync_tables.envs import (
     Identity,
     IdentityReader,
     check_distinct,
-    check_edge,
+    check_listener,
     check_marker_for,
     read_identity,
 )
@@ -43,7 +43,10 @@ class Sink:
         create_table_if_missing: bool = True,
         log_summaries: bool = False,
         publisher: "Publisher | None" = None,
+        accept_from: Iterable[str] | None = None,
     ) -> None:
+        """`accept_from`: the sources this sink accepts (`receive --accept-from`). None leaves
+        only the compiled rule; the CLI always passes a list."""
         self.engine = engine
         self.allowed_schemas = frozenset(allowed_schemas)
         if not self.allowed_schemas:
@@ -52,6 +55,7 @@ class Sink:
         self.create_table_if_missing = create_table_if_missing
         self.log_summaries = log_summaries
         self.publisher = publisher
+        self.accept_from = None if accept_from is None else frozenset(accept_from)
 
     @property
     def caps(self) -> list[str]:
@@ -106,7 +110,7 @@ class Sink:
         except (KeyError, TypeError, ValueError):
             raise Refused("bad_message", "malformed offer") from None
 
-        check_edge(from_env, to_env)
+        check_listener(from_env, to_env, self.accept_from, end="from")
         if source.env != from_env:
             raise Refused("marker_mismatch", f"the source says it is {source.env!r}, the edge starts at {from_env!r}")
         mine = self.identity_for(to_env)
