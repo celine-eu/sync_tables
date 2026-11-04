@@ -21,9 +21,13 @@ The design, the security model and the operating guide are in [`docs/`](docs/REA
 
 ```bash
 uv sync
-# .env (or the environment): DB_LOCAL, and for a pull SYNC_SOURCE_URL, SYNC_TLS_CA (the
-# pull CA's certificate) and SYNC_TOKEN (your own token); see .env.example
+cp .env.example .env              # DB_LOCAL, and for a pull SYNC_SOURCE_URL, SYNC_TLS_CA
+                                  # (the pull CA's certificate) and SYNC_TOKEN (your own token)
+cp config.sample.yaml config.yaml # optional: global settings and a table list
 ```
+
+`.env`, `config.yaml`, `config/`, `pki/` and `taskfile.local.yml` are gitignored: real
+connection settings, table lists and client material stay outside the repository.
 
 ## Usage
 
@@ -84,7 +88,8 @@ the profile's schemas; for a prod sink, its own mounted allowlist.
 named configs under `config/` next to it hold table lists. Both are optional: without
 `config.yaml` the tool reads `DB_DEV` and `DB_LOCAL` from the environment, with
 parallelism 4 and batches of 5000, and a run takes its tables from `--profile FILE`.
-The image ships neither.
+The image ships neither. The repository ships only
+[`config.sample.yaml`](config.sample.yaml), which loads as it is (a test checks it).
 
 ```yaml
 # config.yaml
@@ -233,6 +238,15 @@ client side): by default 5 failures within 60 s lock it out for 5 minutes, and 5
 all clients refuse everyone until the window drains. See `--auth-*` in `serve --help`
 and [`docs/operations.md`](docs/operations.md#failed-attempt-limit).
 
+## Local tasks
+
+`taskfile.yaml` holds the generic tasks (`task test`, `task test:pg`, `task lint`, `task check:public`,
+`task run:pull CONFIG=<name>`). A deployment that uses the tool keeps its own tasks (its
+named configs, a first-time setup, a check against its serving source) in a
+`taskfile.local.yml` beside it. That file is gitignored and included with
+`optional: true, flatten: true`, so its tasks appear without a prefix and the repository
+works without it.
+
 ## Logs
 
 Log lines carry table names, row counts, watermarks, durations and refusal codes.
@@ -248,14 +262,30 @@ named configs, no `.env`, no certificates, no profile. Mount a profile and pass
 mounted keys and the token must be readable by that user. `version.txt` holds the
 version; the image tag is the version.
 
+A change to `version.txt` on `main` releases: `.github/workflows/release.yaml` runs the
+tests, then builds and pushes `ghcr.io/celine-eu/sync-tables:<version>`. An existing tag
+is never overwritten; bump `version.txt` to release again.
+
 ## Tests
 
 ```bash
-task test       # SQLite and an in-process loopback; the Postgres tests skip
-task test:pg    # everything, against two throwaway local PostGIS containers
+task test          # SQLite and an in-process loopback; the Postgres tests skip
+task test:pg       # everything, against two throwaway local PostGIS containers
+task lint          # ruff, the rule set in pyproject.toml
+task check:public  # the tree holds no keys, tokens, real hosts or addresses
 ```
 
 The Postgres tests need two clusters (source and target must have different system
 identifiers): `SYNC_TABLES_TEST_PG_URL` and `SYNC_TABLES_TEST_PG_URL_2`. They skip a
 database that carries a marker other than `local`. Never point them at a shared
 database.
+
+`task check:public` (and CI) checks structural patterns only: private keys, certificate
+bodies, tokens, addresses outside the loopback and documentation ranges, hostnames and
+e-mail addresses outside the `example.*` domains, environment-prefixed warehouse schemas
+and personal identifiers. `NAMES=<file>` adds a list of reserved names kept outside the
+repository; a finding is reported as `path:line: label`, never with the matched text.
+
+## License
+
+Apache License 2.0, see [`LICENSE`](LICENSE).
