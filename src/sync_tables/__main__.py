@@ -234,6 +234,9 @@ def receive_main(argv: list[str]) -> int:
                         "again against --client-ca, and a request without one is refused [SYNC_UPSTREAM_CERT_HEADER]")
     p.add_argument("--accept-from", action="append", default=_env_list("SYNC_ACCEPT_FROM"), metavar="ENV",
                    help="a source environment this sink accepts (repeatable; required) [SYNC_ACCEPT_FROM, comma-separated]")
+    p.add_argument("--events", action="store_true", default=env("SYNC_EVENTS", "").lower() in ("1", "true", "yes"),
+                   help="publish the run events a push carries on this environment's broker (extra `events`; "
+                        "the broker and client from CELINE_MQTT_* and CELINE_OIDC_*) [SYNC_EVENTS]")
     _limit_args(p, env)
     p.add_argument("--no-create-tables", action="store_true", help="refuse tables that do not exist yet")
     a = p.parse_args(argv)
@@ -258,6 +261,7 @@ def _receive(a: argparse.Namespace) -> int:
     from sync_tables.wss import make_server, start_health  # noqa: PLC0415
 
     accept_from = _edge_list(a.accept_from, "--accept-from", "the source environments this sink accepts")
+    publisher = _events_publisher(a.events)
     dsn = os.environ.get("SYNC_SINK_DSN")
     if not dsn:
         raise SyncError("SYNC_SINK_DSN is not set")
@@ -269,14 +273,26 @@ def _receive(a: argparse.Namespace) -> int:
         ensure_postgis(conn)
     _check_listener_edges(me.env, accept_from, end="from")
     sink = Sink(engine, schemas, create_table_if_missing=not a.no_create_tables, log_summaries=True,
-                accept_from=accept_from)
+                accept_from=accept_from, publisher=publisher)
 
     host, _, port = a.listen.rpartition(":")
     health = start_health(host or "0.0.0.0", a.health_port)
     server = make_server(sink, host or "0.0.0.0", int(port), tokens, tls, limiter=_limiter(a), upstream_cert=upstream)
     return _listen(server, health, f"sink: environment {me.env}, accepts from {', '.join(sorted(accept_from))}, "
                                    f"{len(schemas)} allowed schema(s), "
-                                   f"{len(tokens.names)} token holder(s), {_tls_line(tls, upstream)}; listening")
+                                   f"{len(tokens.names)} token holder(s), {_tls_line(tls, upstream)}, "
+                                   f"events {'on' if publisher else 'off'}; listening")
+
+
+def _events_publisher(enabled: bool):
+    """The sink's publisher: None unless asked; refuse to start when the extra is missing."""
+    if not enabled:
+        return None
+    try:
+        from sync_tables.publish_mqtt import MqttPublisher  # noqa: PLC0415
+    except ImportError:
+        raise SyncError("--events needs the `events` extra (celine-sdk): install sync-tables[events]") from None
+    return MqttPublisher.from_env()
 
 
 # ---------------------------------------------------------------------------
