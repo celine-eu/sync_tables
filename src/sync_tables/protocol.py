@@ -13,6 +13,9 @@ The conversation is the same whichever side dials:
     then, per view (after every table):
     source -> sink   view     {schema, name, body}
     sink -> source   ok / err
+    then, once, only when the sink's accept had caps ["events"] and nothing failed:
+    source -> sink   events   {items: [PipelineRunEvent, ...]}
+    sink -> source   ok {published}                               or  err {code, message}
     source -> sink   bye
 
 On a pull the sink dials, so it opens each connection with a request, and the source
@@ -166,15 +169,19 @@ def serve_sink(
         if reraise:
             raise Refused("bad_message", str(e)) from None
         return False
-    send(ch, {"t": "accept", **state})
+    caps = list(getattr(sink, "caps", []))
+    send(ch, {"t": "accept", **state, **({"caps": caps} if caps else {})})
 
     while True:
         try:
-            msg = recv(ch, "table", "view", "bye")
+            msg = recv(ch, "table", "view", "events", "bye")
         except ConnectionLost:
             return False
         if msg["t"] == "bye":
             return True
+        if msg["t"] == "events":
+            _serve_events(ch, sink, msg)
+            continue
         if msg["t"] == "view":
             _serve_view(ch, sink, msg, settled)
             continue
@@ -193,6 +200,15 @@ def _serve_view(ch: Channel, sink: Any, msg: dict[str, Any], settled: list[tuple
         _sink_log(sink, f"ERROR {label}: view not recreated: {safe_error(e)}")
         settled.append((label, False))
         send(ch, {"t": "err", "code": code, "message": safe_error(e)})
+
+
+def _serve_events(ch: Channel, sink: Any, msg: dict[str, Any]) -> None:
+    """Publish the run events of a push whose tables and views all settled ok."""
+    if "events" not in getattr(sink, "caps", []):
+        send(ch, {"t": "err", "code": "events_unsupported", "message": "this sink does not publish events"})
+        return
+    published = sink.publish_events(msg.get("items"))
+    send(ch, {"t": "ok", "published": published})
 
 
 def _serve_table(ch: Channel, sink: Any, msg: dict[str, Any], settled: list[tuple[str, bool]]) -> bool:

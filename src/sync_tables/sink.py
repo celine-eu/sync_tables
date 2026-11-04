@@ -28,6 +28,7 @@ from sync_tables.envs import (
     read_identity,
 )
 from sync_tables.log import Refused, SyncError, log, safe_error
+from sync_tables.publish import Publisher, topic_for, valid_namespace
 from sync_tables.sync import normalize_watermark, upsert_batch
 
 PG_MAX_PARAMS = 65535
@@ -41,6 +42,7 @@ class Sink:
         identify: IdentityReader | None = None,
         create_table_if_missing: bool = True,
         log_summaries: bool = False,
+        publisher: "Publisher | None" = None,
     ) -> None:
         self.engine = engine
         self.allowed_schemas = frozenset(allowed_schemas)
@@ -49,6 +51,37 @@ class Sink:
         self._identify = identify or (lambda c: read_identity(c, side="target"))
         self.create_table_if_missing = create_table_if_missing
         self.log_summaries = log_summaries
+        self.publisher = publisher
+
+    @property
+    def caps(self) -> list[str]:
+        """What this sink advertises in `accept`: `events` when it can publish them."""
+        return ["events"] if self.publisher is not None else []
+
+    def publish_events(self, items: Any) -> int:
+        """Publish each run event unchanged on its namespace's topic; never raises.
+
+        An item that is not a map with a namespace usable as one topic level is skipped
+        and logged. A broker failure is logged and counts as nothing published: the
+        tables are committed already, and the push stays `ok`.
+        """
+        if self.publisher is None:
+            raise Refused("events_unsupported", "this sink has no publisher")
+        messages: list[tuple[str, dict[str, Any]]] = []
+        for item in items if isinstance(items, list) else []:
+            if isinstance(item, dict) and valid_namespace(item.get("namespace")):
+                messages.append((topic_for(item), item))
+            else:
+                log("WARNING events: an item without a usable namespace was not published")
+        if not messages:
+            return 0
+        try:
+            published = int(self.publisher.publish(messages))
+        except Exception as e:
+            log(f"ERROR events: publish failed, {len(messages)} event(s) not published: {safe_error(e)}")
+            return 0
+        log(f"events: published {published} of {len(messages)}")
+        return published
 
     # -- guards ---------------------------------------------------------------
 
