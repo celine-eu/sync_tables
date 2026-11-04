@@ -29,11 +29,20 @@ from sync_tables.sync import normalize_watermark, stream_all_rows, stream_source
 PG_MAX_PARAMS = 65535
 
 
+# What became of the run events a push carried (RunResult.events_state).
+EVENTS_NONE = "none"                # the run carried none
+EVENTS_DELIVERED = "delivered"      # the sink took them (and published what it could)
+EVENTS_UNDELIVERED = "undelivered"  # a table or view failed, or the events exchange did: keep them
+EVENTS_UNSUPPORTED = "unsupported"  # the sink does not take events: they are dropped
+
+
 @dataclass
 class RunResult:
     ok: list[str] = field(default_factory=list)
     failed: list[str] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
+    events_state: str = EVENTS_NONE
+    events_published: int = 0
 
     def merge(self, other: "RunResult") -> None:
         self.ok += other.ok
@@ -114,7 +123,14 @@ class Source:
         parallelism: int = 1,
         full_refresh: bool = False,
         retries: int = 1,
+        events: list[dict[str, Any]] | None = None,
     ) -> RunResult:
+        """Copy every table, then every view, then hand the sink `events`.
+
+        The events go in one exchange of their own, after everything else, and only when
+        no table or view failed (plan decision 4). `RunResult.events_state` says what
+        became of them. A refusal raises before anything is sent.
+        """
         self.check_identity()
         plan = self.plan(specs)
         result = RunResult(skipped=list(plan.skipped))
@@ -148,7 +164,39 @@ class Source:
 
         if plan.views:
             result.merge(self._run_group([], plan.views, open_channel, full_refresh, retries))
+        if events:
+            if result.failed:
+                log(f"events: {len(events)} kept back, {len(result.failed)} table(s) or view(s) failed")
+                result.events_state = EVENTS_UNDELIVERED
+            else:
+                self._deliver_events(open_channel, events, result)
         return result
+
+    def _deliver_events(
+        self, open_channel: Callable[[], Channel], events: list[dict[str, Any]], result: RunResult
+    ) -> None:
+        ch = open_channel()
+        try:
+            accept = self._offer(ch, [], [])
+            if "events" not in (accept.get("caps") or []):
+                log(f"events: the sink does not take events; {len(events)} dropped")
+                result.events_state = EVENTS_UNSUPPORTED
+            else:
+                send(ch, {"t": "events", "items": events})
+                reply = recv(ch, "ok", "err")
+                if reply["t"] == "ok":
+                    result.events_state = EVENTS_DELIVERED
+                    result.events_published = int(reply.get("published") or 0)
+                    log(f"events: {len(events)} handed to the sink, {result.events_published} published")
+                else:
+                    log(f"ERROR events [{reply.get('code')}]: {reply.get('message')}")
+                    result.events_state = EVENTS_UNDELIVERED
+            send(ch, {"t": "bye"})
+        except ConnectionLost:
+            log(f"ERROR events: connection lost, {len(events)} kept back")
+            result.events_state = EVENTS_UNDELIVERED
+        finally:
+            ch.close()
 
     def _run_group(
         self,
@@ -194,20 +242,7 @@ class Source:
         result: RunResult,
     ) -> None:
         """Offer, then send tables and views, popping each from its list once settled."""
-        assert self.identity is not None
-        send(ch, {
-            "t": "offer",
-            "v": PROTOCOL_VERSION,
-            "edge": list(self.edge),
-            "env": self.identity.env,
-            "sysid": self.identity.system_identifier,
-            "tables": [{"schema": t.schema, "table": t.table, "date_column": t.date_column} for t in tables],
-            "views": [{"schema": s, "name": n} for s, n in views],
-        })
-        accept = recv(ch, "accept")
-        sink_identity = Identity(env=str(accept["env"]), system_identifier=str(accept["sysid"]))
-        expect_env(sink_identity, self.edge[1], "target")
-        check_distinct(self.identity, sink_identity)
+        accept = self._offer(ch, tables, views)
         watermarks: dict[str, Any] = accept.get("watermarks") or {}
 
         with self.connect() as conn:
@@ -233,6 +268,24 @@ class Source:
                     result.failed.append(label)
                 views.pop(0)
         send(ch, {"t": "bye"})
+
+    def _offer(self, ch: Channel, tables: list[TableSpec], views: list[tuple[str, str]]) -> dict[str, Any]:
+        """Send the offer; check the sink's identity in its accept and return the accept."""
+        assert self.identity is not None
+        send(ch, {
+            "t": "offer",
+            "v": PROTOCOL_VERSION,
+            "edge": list(self.edge),
+            "env": self.identity.env,
+            "sysid": self.identity.system_identifier,
+            "tables": [{"schema": t.schema, "table": t.table, "date_column": t.date_column} for t in tables],
+            "views": [{"schema": s, "name": n} for s, n in views],
+        })
+        accept = recv(ch, "accept")
+        sink_identity = Identity(env=str(accept["env"]), system_identifier=str(accept["sysid"]))
+        expect_env(sink_identity, self.edge[1], "target")
+        check_distinct(self.identity, sink_identity)
+        return accept
 
     def _send_table(self, ch: Channel, conn: Connection, spec: TableSpec, raw_wm: Any, full_refresh: bool) -> bool:
         label = f"{spec.schema}.{spec.table}"
