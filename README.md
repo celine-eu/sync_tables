@@ -3,8 +3,9 @@
 Copy PostgreSQL tables from a `dev` warehouse to a developer's local database, or
 mirror them to `prod`, `staging` or `preprod`. Copies are incremental (on a date watermark, with an optional
 re-copied window) or full, views are recreated from their definition, and the copy
-runs **one way only**: `dev → local`, `dev → prod`, `dev → staging` and `dev → preprod`,
-never the other ways. staging and preprod are read-only copies, like prod: nothing leaves them.
+runs **one way only**, along edges both sides declare. One rule is compiled in: only `dev`
+writes to `prod`. A **relay** takes the pipelines' run events and pushes them with the
+data, so each environment hears of a run only after its tables have arrived.
 
 The tool has two roles. A **source** reads its database and sends what the target is
 missing. A **sink** holds the target database, checks every guard itself, and applies
@@ -56,22 +57,34 @@ Exit codes: `0` everything copied, `1` some tables failed (the others are copied
 
 ## Environments and the guards
 
-| Edge | Transport |
+| Edge (typical) | Transport |
 |---|---|
 | `dev → local` | pull: this process dials a serving source beside dev over WSS and writes the local database. Or direct, without `SYNC_SOURCE_URL`: it reads `DB_DEV` itself |
 | `dev → prod` | push: this process (beside dev) sends to a sink in prod over WSS |
 | `dev → staging`, `dev → preprod` | push, as `dev → prod`, to that environment's sink |
 
-The transport follows from the URL given: `--source-url` pulls, `--sink-url` pushes,
-neither copies directly. An edge refuses a transport it does not use.
+An environment is any lowercase word (`[a-z][a-z0-9-]*`). **One rule is compiled in:** a
+sink marked `prod` accepts only a source marked `dev`, whatever a config says. **Every
+other edge is declared on both sides**: the side that dials lists it, with its transports,
+in the `edges` of its config file (`--config`, `SYNC_CONFIG`, default `./config.yaml`):
 
-Every other edge, including the reverse of each, is refused before any connection is
-opened. The edges are compiled into the tool; no configuration can add one.
+```yaml
+edges:
+  - {from: dev, to: local, transports: [pull, direct]}
+  - {from: dev, to: prod, transports: [push]}
+```
+
+and the side that listens names the other end: `receive --accept-from dev`,
+`serve --serve-to local`. An edge either side does not declare is refused before any
+connection is opened (`edge_not_allowed`).
+
+The transport follows from the URL given: `--source-url` pulls, `--sink-url` pushes,
+neither copies directly. An edge refuses a transport it does not declare.
 
 Each database says which environment it is, as a comment on the database:
 
 ```sql
-COMMENT ON DATABASE warehouse IS 'celine:env=local';   -- or dev, prod
+COMMENT ON DATABASE warehouse IS 'celine:env=local';   -- or dev, prod, staging, …
 ```
 
 The tool reads it on both sides and refuses a run when a marker is missing,
@@ -165,7 +178,7 @@ inside its own schema allowlist, and refuses to start on an unmarked database. I
 answers a pull on an edge that starts at its own marker and pulls, nothing else.
 
 ```bash
-SYNC_SOURCE_DSN=… sync-tables serve \
+SYNC_SOURCE_DSN=… sync-tables serve --serve-to local \
   --listen 0.0.0.0:8443 --health-port 8081 \
   --allow-schemas /etc/sync/allow.txt \
   --token-file /etc/sync/tokens/ \
@@ -190,7 +203,7 @@ A sink runs beside the target database. Its database URL comes from `SYNC_SINK_D
 never from the command line, and it refuses to start on an unmarked database.
 
 ```bash
-SYNC_SINK_DSN=… sync-tables receive \
+SYNC_SINK_DSN=… sync-tables receive --accept-from dev \
   --listen 0.0.0.0:8443 --health-port 8081 \
   --allow-schemas /etc/sync/allow.txt \
   --token-file /etc/sync/tokens/ \
@@ -212,7 +225,7 @@ an environment variable: `SYNC_SINK_URL`, `SYNC_TLS_CA`, `SYNC_TLS_CERT`,
 `SYNC_TLS_KEY`, `SYNC_TOKEN_FILE`):
 
 ```bash
-sync-tables --from dev --to prod --profile /etc/sync/profile.yaml \
+sync-tables --from dev --to prod --config /etc/sync/config.yaml --profile /etc/sync/profile.yaml \
   --sink-url wss://sink.example.org --ca ca.crt --cert client.crt --key client.key --token-file token
 ```
 
@@ -237,6 +250,30 @@ A listener locks out a client after repeated wrong tokens (`429`, `rate_limited`
 client side): by default 5 failures within 60 s lock it out for 5 minutes, and 50 across
 all clients refuse everyone until the window drains. See `--auth-*` in `serve --help`
 and [`docs/operations.md`](docs/operations.md#failed-attempt-limit).
+
+## Run events: the relay
+
+The pipelines' flows POST each run event to a relay, one relay per environment. The relay
+keeps the `completed` ones and pushes them after the tables; the sink publishes each on
+`celine/pipelines/runs/<namespace>` on its broker. Details in
+[`docs/architecture.md`](docs/architecture.md#run-events-and-the-relay).
+
+```bash
+# One relay per sink, from one config (relay.sample.yaml shows its shape)
+DB_DEV=… sync-tables relay --config relay.yaml --sink prod --listen 0.0.0.0:8080
+sync-tables relay --config relay.yaml --sink prod --check-config   # load and check, open nothing
+
+# The sink publishes what the push carries (extra `events`; broker and client from CELINE_MQTT_*, CELINE_OIDC_*)
+sync-tables receive --accept-from dev --events …
+
+# Development, flows and services on one database: no data push, events straight to the broker
+sync-tables relay --local --listen 0.0.0.0:8080
+```
+
+`POST /events` takes no token: run the relay behind a ClusterIP Service whose
+NetworkPolicy admits only the flows' namespace (`docs/security.md`). The `events` extra
+(`uv sync --extra events`, or `pip install 'sync-tables[events]'`) brings celine-sdk; the
+image carries it.
 
 ## Local tasks
 

@@ -15,14 +15,19 @@ about itself when it can check the fact on its own side.
 
 ## Guards
 
-### 1. Edges are compiled in
+### 1. One rule compiled in, every other edge declared on both sides
 
-Only `dev → local` (pull or direct) and `dev → prod` (push) exist. Any other pair,
-including the reverse of each, fails with `edge_not_allowed` before a connection is
-opened. A transport the edge does not list fails with `transport_mismatch`.
+A sink marked `prod` accepts only a source marked `dev` (`prod_only_from_dev`), whatever
+any configuration says. Every other edge must be declared by the side that dials (the
+`edges` of its config file, with its transports) and by the side that listens
+(`receive --accept-from`, `serve --serve-to`, both required). An edge either side does not
+declare fails with `edge_not_allowed` before a connection is opened; a transport the edge
+does not declare fails with `transport_mismatch`. A listener whose own list breaks the rule
+refuses to start.
 
 *Stops:* a copy running backwards, in either direction, through a typo or a misconfigured
-job.
+job; a single changed file opening an edge; any configuration writing into prod from
+anything but dev.
 
 ### 2. Each database states its environment
 
@@ -216,6 +221,16 @@ The perimeter is only as good as the network configuration. If the ingress that 
 the internal host name also listens on a public address, a request to that address with
 the internal `Host` header reaches the listener. Verify that the internal host is
 unreachable from outside ([operations.md](operations.md#checks)).
+
+### The relay takes no token
+
+`POST /events` checks no credential: the flows have none a relay could check. The
+relay's boundary is the network: run it behind a ClusterIP Service with no Ingress, and a
+NetworkPolicy that admits only the flows' namespace. A pod inside that namespace can forge
+a `completed` event; the worst outcome is a listener running once more than needed, so
+listeners must be idempotent. The relay never takes data or SQL from a request: an event
+is validated, kept in memory, and published unchanged on a topic built from its namespace,
+which must be one topic level (no `/`, `+`, `#`).
 
 ### TLS behind an ingress
 

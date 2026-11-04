@@ -57,3 +57,14 @@ def test_sample_declares_the_developer_edge():
     from sync_tables.envs import DIRECT, PULL
 
     assert load_edges(str(SAMPLE)).declared == {("dev", "local"): (PULL, DIRECT)}
+
+
+def test_the_relay_sample_loads_for_each_of_its_sinks(monkeypatch):
+    from sync_tables.relay import load_relay_config
+
+    monkeypatch.setenv("DB_DEV", "postgresql+psycopg://reader@example-dev.example.org/warehouse")
+    for sink in ("prod", "staging"):
+        cfg = load_relay_config(str(ROOT / "relay.sample.yaml"), sink)
+        assert (cfg.from_env, cfg.to_env) == ("dev", sink)
+        assert cfg.sources and cfg.min_interval == cfg.max_interval == 1800
+        assert cfg.url.startswith("wss://") and cfg.url.endswith(".example.org/sync/v1")
