@@ -55,6 +55,7 @@ def joined(sep: str, *parts: str) -> str:
         ("hostname", "url: wss://sync." + "acme-energy" + ".it/sync/v1"),
         ("hostname", "see https://portal." + "acme" + ".cloud/x"),
         ("hostname", "ask " + "acme" + ".ch for access."),
+        ("hostname", "host: db." + "acme" + ".internal"),
         ("email", "contact: someone@" + "acme" + ".com"),
         ("address", "dsn: postgresql://u:p@" + joined(".", "10", "20", "30", "40") + "/db"),
         ("schema", "schema: " + joined("_", "wh", "dev", "gold")),
@@ -88,6 +89,9 @@ def test_structural_patterns_are_refused(check, tmp_path, label, text):
         "self.ch = ch; self.ch.close(); cls.it",
         "if a.local: cfg.dev and args.internal",
         "COMMENT ON DATABASE warehouse IS 'celine:env=dev'",
+        "extra_hosts: host.docker.internal:host-gateway",
+        "RUN_EVENTS_URLS=http://host.docker.internal:8095/events",
+        "CELINE_MQTT_HOST: ${CELINE_MQTT_HOST:-host.docker.internal}",
     ],
 )
 def test_generic_text_passes(check, tmp_path, text):
