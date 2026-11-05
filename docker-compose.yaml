@@ -1,0 +1,33 @@
+# The relay in `local` mode, for a development stack where flows and services share one
+# database: no data push, each `completed` run event goes straight to the broker on
+# celine/pipelines/runs/<namespace>. The flows reach it with
+#   RUN_EVENTS_URLS=http://host.docker.internal:${SYNC_RELAY_PORT:-8095}/events
+#
+# The broker and the OIDC client come from CELINE_MQTT_* and CELINE_OIDC_*, as in every
+# CELINE service; celine-sdk's defaults point at a local stack (broker on
+# host.docker.internal:1883, issuer keycloak.celine.localhost). The client needs the
+# `pipelines.runs.write` scope and the optional `mqtt` scope. Override any of them in a
+# gitignored .env beside this file.
+services:
+  sync-tables-relay:
+    image: ${SYNC_TABLES_IMAGE:-ghcr.io/celine-eu/sync-tables:0.8.0}
+    command: ["relay", "--local", "--listen", "0.0.0.0:8080"]
+    restart: unless-stopped
+    environment:
+      # celine-sdk is hardened unless told otherwise; a local stack says `dev`.
+      CELINE_ENV: ${CELINE_ENV:-}
+      CELINE_MQTT_HOST: ${CELINE_MQTT_HOST:-host.docker.internal}
+      CELINE_MQTT_PORT: ${CELINE_MQTT_PORT:-1883}
+      CELINE_OIDC_BASE_URL: ${CELINE_OIDC_BASE_URL:-http://keycloak.celine.localhost/realms/celine}
+      CELINE_OIDC_CLIENT_ID: ${CELINE_OIDC_CLIENT_ID:-svc-pipelines}
+      CELINE_OIDC_CLIENT_SECRET: ${CELINE_OIDC_CLIENT_SECRET:-svc-pipelines}
+    ports:
+      - "${SYNC_RELAY_PORT:-8095}:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+      - "keycloak.celine.localhost:host-gateway"
