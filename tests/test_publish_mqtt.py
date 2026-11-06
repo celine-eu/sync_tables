@@ -6,6 +6,9 @@ Skipped without the extra.
 """
 from __future__ import annotations
 
+import asyncio
+import time
+
 import pytest
 
 pytest.importorskip("celine.sdk.broker")
@@ -30,6 +33,8 @@ class Result:
 class FakeBroker:
     instances: list["FakeBroker"] = []
     fail_connect = False
+    hang_connect = False
+    hang_publish = False
     refuse_topics: set[str] = set()
 
     def __init__(self, config=None, token_provider=None) -> None:
@@ -41,9 +46,13 @@ class FakeBroker:
     async def connect(self) -> None:
         if FakeBroker.fail_connect:
             raise ConnectionError("broker unreachable")
+        if FakeBroker.hang_connect:
+            await asyncio.sleep(60)
         self.connected = True
 
     async def publish(self, message) -> Result:
+        if FakeBroker.hang_publish:
+            await asyncio.sleep(60)
         self.published.append(message)
         return Result(message.topic not in FakeBroker.refuse_topics)
 
@@ -55,6 +64,8 @@ class FakeBroker:
 def fake_broker(monkeypatch):
     FakeBroker.instances = []
     FakeBroker.fail_connect = False
+    FakeBroker.hang_connect = False
+    FakeBroker.hang_publish = False
     FakeBroker.refuse_topics = set()
     monkeypatch.setattr(publish_mqtt, "MqttBroker", FakeBroker)
     return FakeBroker
@@ -88,6 +99,64 @@ def test_an_unreachable_broker_raises_and_the_connection_is_still_closed():
     with pytest.raises(ConnectionError):
         publisher().publish(MESSAGES)
     assert FakeBroker.instances[0].disconnected
+
+
+@pytest.mark.parametrize("hang", ["hang_connect", "hang_publish"])
+def test_a_broker_that_does_not_answer_raises_within_the_bound(hang):
+    """A push waits for the publisher, so a silent broker must not hold it: the whole
+    publication, connect included, is bounded and the connection still closed.
+    """
+    setattr(FakeBroker, hang, True)
+    pub = MqttPublisher(publish_mqtt.MqttConfig(host="broker.example.org"), token_provider=None, timeout=0.1)
+    started = time.monotonic()
+    with pytest.raises(TimeoutError, match="0.1"):
+        pub.publish(MESSAGES)
+    assert time.monotonic() - started < 5
+    assert FakeBroker.instances[0].disconnected
+
+
+def test_the_bound_defaults_to_30_seconds():
+    assert publisher().timeout == 30.0
+
+
+def test_a_broker_refusing_the_token_fails_the_publish_instead_of_hanging(monkeypatch):
+    """The 2026-11-06 staging hang, against celine-sdk's real broker: a refused connect
+    with the publisher's bounded retries ends in an error, not a wait (celine-sdk >= 2.2.3).
+    """
+    from celine.sdk.broker import MqttBroker  # noqa: PLC0415
+
+    class Refusing:
+        def __init__(self, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            raise RuntimeError("Not authorized")
+
+        async def __aexit__(self, *exc) -> None:
+            pass
+
+    monkeypatch.setattr(publish_mqtt, "MqttBroker", MqttBroker)
+    monkeypatch.setattr("celine.sdk.broker.mqtt.aiomqtt.Client", Refusing)
+    config = publish_mqtt.MqttConfig(host="broker.example.org", reconnect_interval=0.01, max_reconnect_attempts=2)
+    pub = MqttPublisher(config, token_provider=None, timeout=5)
+    started = time.monotonic()
+    with pytest.raises(ConnectionError):
+        pub.publish(MESSAGES)
+    assert time.monotonic() - started < 2
+
+
+def test_a_silent_broker_leaves_the_push_ok_with_nothing_published():
+    from test_events import EVENTS, INCR, make_pair, seed  # noqa: PLC0415
+
+    from sync_tables.protocol import loopback_to  # noqa: PLC0415
+
+    FakeBroker.hang_publish = True
+    pub = MqttPublisher(publish_mqtt.MqttConfig(host="broker.example.org"), token_provider=None, timeout=0.1)
+    src, tgt, source, sink = make_pair(publisher=pub)
+    seed(src)
+    result = source.run([INCR], loopback_to(sink), events=EVENTS)
+    assert result.failed == [] and result.ok
+    assert result.events_state == "delivered" and result.events_published == 0
 
 
 def test_from_env_reads_the_celine_settings(monkeypatch):

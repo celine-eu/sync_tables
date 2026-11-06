@@ -193,7 +193,10 @@ flow ── HTTP POST /events ──► relay (one per environment, no token: th
   without the capability drops them, with a log line.
 - **The sink publishes** each item unchanged with the `events` extra (celine-sdk), on the
   broker and with the client named by `CELINE_MQTT_*` and `CELINE_OIDC_*`. A publish
-  failure is logged and the push stays `ok`: the tables are committed already.
+  failure is logged and the push stays `ok`: the tables are committed already. The whole
+  publication (connect, publish, close) is bounded at 30 s, and a broker refusing the
+  connection fails after its retries (celine-sdk ≥ 2.2.3), so a silent or refusing broker
+  costs the push its events, never the push itself.
 - **Delivery is at most once.** A lost event is not replayed; listeners that need every run
   check on their own timer.
 - **`local` mode** (`relay --local`), for a development stack where flows and services

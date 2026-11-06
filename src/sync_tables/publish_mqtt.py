@@ -1,7 +1,8 @@
 """The MQTT publisher of a sink's run events (extra `events`: celine-sdk).
 
 One connection per push: connect, publish each message with QoS 1 and no retain,
-disconnect. The broker and the client credentials come from celine-sdk's settings, read
+disconnect, all of it within `timeout` seconds (30 by default) so a silent broker cannot hold
+the push. The broker and the client credentials come from celine-sdk's settings, read
 from the environment (`CELINE_MQTT_*`, `CELINE_OIDC_*`), the same variables every CELINE
 service reads; the token is requested for the broker (celine-sdk's `mqtt` scope).
 """
@@ -20,9 +21,15 @@ from sync_tables.log import log
 class MqttPublisher:
     """Publishes (topic, payload) pairs on one broker; see `sync_tables.publish.Publisher`."""
 
-    def __init__(self, config: MqttConfig, token_provider: OidcClientCredentialsProvider | None) -> None:
+    def __init__(
+        self,
+        config: MqttConfig,
+        token_provider: OidcClientCredentialsProvider | None,
+        timeout: float = 30.0,
+    ) -> None:
         self.config = config
         self.token_provider = token_provider
+        self.timeout = timeout
 
     @classmethod
     def from_env(cls) -> "MqttPublisher":
@@ -59,8 +66,18 @@ class MqttPublisher:
         return cls(config, provider)
 
     def publish(self, messages: list[tuple[str, dict[str, Any]]]) -> int:
-        """Publish every message; return how many the broker took. Raises when it cannot connect."""
-        return asyncio.run(self._publish(messages))
+        """Publish every message; return how many the broker took.
+
+        Raises when it cannot connect, and `TimeoutError` when connecting, publishing and
+        closing take longer than `timeout` seconds; the sink then counts nothing published.
+        """
+        return asyncio.run(self._bounded(messages))
+
+    async def _bounded(self, messages: list[tuple[str, dict[str, Any]]]) -> int:
+        try:
+            return await asyncio.wait_for(self._publish(messages), timeout=self.timeout)
+        except asyncio.TimeoutError:
+            raise TimeoutError(f"events: the broker did not answer within {self.timeout}s") from None
 
     async def _publish(self, messages: list[tuple[str, dict[str, Any]]]) -> int:
         broker = MqttBroker(config=self.config, token_provider=self.token_provider)

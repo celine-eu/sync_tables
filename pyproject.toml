@@ -20,7 +20,7 @@ sync-tables = "sync_tables.__main__:main"
 
 [project.optional-dependencies]
 events = [
-    "celine-sdk>=2.2.1",
+    "celine-sdk>=2.2.3",
 ]
 
 [build-system]
