@@ -1,6 +1,6 @@
 [project]
 name = "sync-tables"
-version = "0.8.0"
+version = "0.8.1"
 description = "Incremental table sync utility"
 readme = "README.md"
 requires-python = ">=3.13"
